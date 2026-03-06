@@ -6,8 +6,8 @@
  *
  * Architecture:
  * ┌─────────────────────────────────────────────────────────────────────┐
- * │  Capture Thread (hot path — NO mutex, NO alloc)                    │
- * │  pcap_next_ex() → decode inline → write to SPSC ring              │
+ * │  Capture Thread (efficient — NO mutex, NO alloc)                   │
+ * │  pcap_dispatch() callback → decode inline → write to SPSC ring    │
  * │  Target: < 1μs per packet                                          │
  * └─────────────────────┬───────────────────────────────────────────────┘
  *                       │ lock-free SPSC ring (1M slots)

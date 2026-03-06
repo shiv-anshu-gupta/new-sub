@@ -1,0 +1,17 @@
+# SV Standalone Service Log
+# Interface: enp1s0
+# Timestamp: {"tstampType":0,"tstampTypeName":"host","tstampPrecision":0,"nanoActive":false,"isHardware":false,"method":"pcap"}
+# Timeout: 10 ms, Buffer: 10485760 bytes
+#
+
+===== t=1 s =====
+SV: 0 | +0/s | Rate: 0 pps | Drop: 0 | SPSC-lag: 0 | Throughput: 0.00 Mbps
+capture_stats: {"packetsReceived":0,"packetsSV":0,"packetsDropped":0,"bytesReceived":0,"captureElapsedMs":1008,"isCapturing":true,"captureRatePps":0,"throughputMbps":0.00,"spscDropped":0,"spscReadLag":0,"drainTotal":0,"drainBatchAvg":0}
+highperf: captureTotal=0 captureSV=0 spscDropped=0 spscLag=0 drainTotal=0 ratePps=0 throughputMbps=0.00
+poll_json: {"analysis":{"svID":"","totalFrames":0,"missingCount":0,"outOfOrderCount":0,"duplicateCount":0,"errorCount":0,"lastSmpCnt":0,"expectedSmpCnt":0,"smpCntMax":65535,"dupTsTotal":0,"dupTsGroups":0,"dupTsMaxGroup":0},"status":{"initialized":true,"totalReceived":0,"bufferCapacity":20000,"bufferUsed":0},"totalReceived":0,"oldestIndex":0,"gap":false,"gapFrom":0,"gapTo":0,"frames":[],"phasor":{"valid":false,"mode":1,"windowSize":80,"samplesPerCycle":80,"computeCount":0,"timestamp":0,"channels":[]}}
+
+===== t=2 s =====
+SV: 0 | +0/s | Rate: 0 pps | Drop: 0 | SPSC-lag: 0 | Throughput: 0.00 Mbps
+capture_stats: {"packetsReceived":0,"packetsSV":0,"packetsDropped":0,"bytesReceived":0,"captureElapsedMs":2008,"isCapturing":true,"captureRatePps":0,"throughputMbps":0.00,"spscDropped":0,"spscReadLag":0,"drainTotal":0,"drainBatchAvg":0}
+highperf: captureTotal=0 captureSV=0 spscDropped=0 spscLag=0 drainTotal=0 ratePps=0 throughputMbps=0.00
+poll_json: {"analysis":{"svID":"","totalFrames":0,"missingCount":0,"outOfOrderCount":0,"duplicateCount":0,"errorCount":0,"lastSmpCnt":0,"expectedSmpCnt":0,"smpCntMax":65535,"dupTsTotal":0,"dupTsGroups":0,"dupTsMaxGroup":0},"status":{"initialized":true,"totalReceived":0,"bufferCapacity":20000,"bufferUsed":0},"totalReceived":0,"oldestIndex":0,"gap":false,"gapFrom":0,"gapTo":0,"frames":[],"phasor":{"valid":false,"mode":1,"windowSize":80,"samplesPerCycle":80,"computeCount":0,"timestamp":0,"channels":[]}}

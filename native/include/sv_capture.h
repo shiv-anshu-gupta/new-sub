@@ -5,7 +5,7 @@
  * This module provides raw Ethernet packet capture for receiving
  * IEC 61850-9-2LE Sampled Values frames. It mirrors the DLL loading
  * pattern from the SV Publisher's npcap_transmitter_impl.cc but uses
- * pcap_loop / pcap_next_ex for RECEIVING packets instead of sendqueue.
+ * pcap_dispatch for RECEIVING packets instead of sendqueue.
  * 
  * Capture Flow:
  * ```
@@ -13,7 +13,7 @@
  * │  Network Interface (via Npcap)              │
  * │  EtherType 0x88BA BPF filter (kernel)       │
  * └──────────────┬──────────────────────────────┘
- *                │ pcap_next_ex() polling
+ *                │ pcap_dispatch() callback
  *                ▼
  * ┌─────────────────────────────────────────────┐
  * │  sv_highperf_capture_feed()  [lock-free]    │
@@ -56,7 +56,8 @@ extern "C" {
 #define SV_CAP_MAX_DESC         256     /**< Max description length */
 #define SV_CAP_SNAPLEN          65536   /**< Capture snapshot length */
 #define SV_CAP_PROMISC          1       /**< Enable promiscuous mode */
-#define SV_CAP_TIMEOUT_MS       1       /**< Read timeout for pcap_open_live */
+#define SV_CAP_TIMEOUT_MS       10      /**< Read timeout (ms) for pcap_dispatch — balance latency vs CPU */
+#define SV_CAP_BUFFER_SIZE      (10 * 1024 * 1024) /**< Kernel capture buffer: 10 MB */
 
 /*============================================================================
  * Data Structures

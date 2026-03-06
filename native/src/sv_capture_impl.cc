@@ -4,10 +4,10 @@
  * 
  * This is the RECEIVING counterpart to npcap_transmitter_impl.cc.
  * It uses the same dynamic DLL loading pattern but captures packets
- * using pcap_next_ex instead of pcap_sendqueue.
+ * using pcap_dispatch (callback-based batch capture) instead of pcap_sendqueue.
  * 
  * Key differences from the transmitter:
- *   - Uses pcap_next_ex() for packet capture (poll-based)
+ *   - Uses pcap_dispatch() for packet capture (callback-based, CPU-efficient)
  *   - Uses pcap_setfilter() with BPF "ether proto 0x88ba" 
  *   - Uses pcap_breakloop() for clean shutdown
  *   - Spawns a dedicated capture thread
@@ -18,10 +18,10 @@
  *     - pcap_findalldevs / pcap_freealldevs
  *     - pcap_open_live / pcap_close
  *   Capture-specific:
- *     - pcap_next_ex          (read next packet)
+ *     - pcap_dispatch          (callback-based batch capture)
  *     - pcap_compile           (compile BPF filter)
  *     - pcap_setfilter         (apply BPF filter)
- *     - pcap_breakloop         (interrupt pcap_next_ex loop)
+ *     - pcap_breakloop         (interrupt pcap_dispatch loop)
  *     - pcap_datalink          (check link layer type)
  *     - pcap_stats             (kernel drop stats)
  */
@@ -109,12 +109,17 @@ typedef void    (*pcap_breakloop_t)(pcap_t*);
 typedef int     (*pcap_datalink_t)(pcap_t*);
 typedef int     (*pcap_stats_t)(pcap_t*, struct pcap_stat*);
 
+/* pcap_dispatch — callback-based batch capture (lower CPU than pcap_next_ex polling) */
+typedef void    (*pcap_handler_t)(unsigned char*, const struct pcap_pkthdr*, const unsigned char*);
+typedef int     (*pcap_dispatch_t)(pcap_t*, int, pcap_handler_t, unsigned char*);
+
 /* pcap_create/activate pattern (replaces pcap_open_live for timestamp control) */
 typedef pcap_t* (*pcap_create_t)(const char*, char*);
 typedef int     (*pcap_activate_t)(pcap_t*);
 typedef int     (*pcap_set_snaplen_t)(pcap_t*, int);
 typedef int     (*pcap_set_promisc_t)(pcap_t*, int);
 typedef int     (*pcap_set_timeout_t)(pcap_t*, int);
+typedef int     (*pcap_set_buffer_size_t)(pcap_t*, int);
 typedef int     (*pcap_set_immediate_mode_t)(pcap_t*, int);
 
 /* Timestamp type/precision API (Npcap high-precision timestamps) */
@@ -124,20 +129,6 @@ typedef int     (*pcap_set_tstamp_type_t)(pcap_t*, int);
 typedef int     (*pcap_set_tstamp_precision_t)(pcap_t*, int);
 typedef int     (*pcap_get_tstamp_precision_t)(pcap_t*);
 typedef const char* (*pcap_tstamp_type_val_to_name_t)(int);
-
-/*============================================================================
- * Npcap Timestamp Type Constants (from pcap/pcap.h)
- *============================================================================*/
-
-#define SV_PCAP_TSTAMP_HOST              0
-#define SV_PCAP_TSTAMP_HOST_LOWPREC      1
-#define SV_PCAP_TSTAMP_HOST_HIPREC       2
-#define SV_PCAP_TSTAMP_ADAPTER           3
-#define SV_PCAP_TSTAMP_ADAPTER_UNSYNCED  4
-#define SV_PCAP_TSTAMP_HOST_HIPREC_UNSYNCED 5
-
-#define SV_PCAP_TSTAMP_PRECISION_MICRO   0
-#define SV_PCAP_TSTAMP_PRECISION_NANO    1
 
 /*============================================================================
  * Module State
@@ -160,6 +151,7 @@ static pcap_freecode_t      g_freecode = nullptr;
 static pcap_breakloop_t     g_breakloop = nullptr;
 static pcap_datalink_t      g_datalink = nullptr;
 static pcap_stats_t         g_pcap_stats = nullptr;
+static pcap_dispatch_t      g_dispatch = nullptr;
 
 /* pcap_create/activate functions */
 static pcap_create_t        g_pcap_create = nullptr;
@@ -167,6 +159,7 @@ static pcap_activate_t      g_pcap_activate = nullptr;
 static pcap_set_snaplen_t   g_pcap_set_snaplen = nullptr;
 static pcap_set_promisc_t   g_pcap_set_promisc = nullptr;
 static pcap_set_timeout_t   g_pcap_set_timeout = nullptr;
+static pcap_set_buffer_size_t g_pcap_set_buffer_size = nullptr;
 static pcap_set_immediate_mode_t g_pcap_set_immediate_mode = nullptr;
 
 /* Timestamp API functions */
@@ -184,6 +177,22 @@ static pcap_t*              g_handle = nullptr;
 #include <pcap/pcap.h>
 static pcap_t*              g_handle = nullptr;
 #endif
+
+/*============================================================================
+ * Timestamp Type Constants (cross-platform)
+ * On Windows these mirror Npcap's pcap.h values; on Linux pcap/pcap.h provides
+ * PCAP_TSTAMP_* but we use our own SV_PCAP_TSTAMP_* names throughout.
+ *============================================================================*/
+
+#define SV_PCAP_TSTAMP_HOST              0
+#define SV_PCAP_TSTAMP_HOST_LOWPREC      1
+#define SV_PCAP_TSTAMP_HOST_HIPREC       2
+#define SV_PCAP_TSTAMP_ADAPTER           3
+#define SV_PCAP_TSTAMP_ADAPTER_UNSYNCED  4
+#define SV_PCAP_TSTAMP_HOST_HIPREC_UNSYNCED 5
+
+#define SV_PCAP_TSTAMP_PRECISION_MICRO   0
+#define SV_PCAP_TSTAMP_PRECISION_NANO    1
 
 /*============================================================================
  * Capture State
@@ -287,6 +296,7 @@ int sv_capture_load_dll(void) {
     g_breakloop   = (pcap_breakloop_t)GetProcAddress(g_dll, "pcap_breakloop");
     g_datalink    = (pcap_datalink_t)GetProcAddress(g_dll, "pcap_datalink");
     g_pcap_stats  = (pcap_stats_t)GetProcAddress(g_dll, "pcap_stats");
+    g_dispatch    = (pcap_dispatch_t)GetProcAddress(g_dll, "pcap_dispatch");
     
     /* Load pcap_create/activate pattern functions */
     g_pcap_create      = (pcap_create_t)GetProcAddress(g_dll, "pcap_create");
@@ -294,6 +304,7 @@ int sv_capture_load_dll(void) {
     g_pcap_set_snaplen = (pcap_set_snaplen_t)GetProcAddress(g_dll, "pcap_set_snaplen");
     g_pcap_set_promisc = (pcap_set_promisc_t)GetProcAddress(g_dll, "pcap_set_promisc");
     g_pcap_set_timeout = (pcap_set_timeout_t)GetProcAddress(g_dll, "pcap_set_timeout");
+    g_pcap_set_buffer_size = (pcap_set_buffer_size_t)GetProcAddress(g_dll, "pcap_set_buffer_size");
     g_pcap_set_immediate_mode = (pcap_set_immediate_mode_t)GetProcAddress(g_dll, "pcap_set_immediate_mode");
     
     /* Load timestamp API functions */
@@ -325,6 +336,7 @@ int sv_capture_load_dll(void) {
     printf("[capture]   pcap_set_tstamp_type: %s\n", g_pcap_set_tstamp_type ? "OK" : "MISSING");
     printf("[capture]   pcap_set_tstamp_precision: %s\n", g_pcap_set_tstamp_precision ? "OK" : "MISSING");
     printf("[capture]   pcap_set_immediate_mode: %s\n", g_pcap_set_immediate_mode ? "OK" : "MISSING");
+    printf("[capture]   pcap_dispatch: %s\n", g_dispatch ? "OK" : "MISSING");
     
     return 1;
 #else
@@ -476,20 +488,21 @@ int sv_capture_open(const char *device_name) {
         g_pcap_set_promisc(g_handle, SV_CAP_PROMISC);
         g_pcap_set_timeout(g_handle, SV_CAP_TIMEOUT_MS);
         
-        /* Step 2b: Enable immediate mode — deliver each packet individually
-         * instead of batching in the Npcap driver buffer.
-         * This eliminates software-level batching (driver sets MinToCopy=0)
-         * so pcap_next_ex() returns as soon as each packet arrives. */
-        if (g_pcap_set_immediate_mode) {
-            int rc = g_pcap_set_immediate_mode(g_handle, 1);
+        /* Set kernel capture buffer to 10 MB (default is ~2 MB on most systems) */
+        if (g_pcap_set_buffer_size) {
+            int rc = g_pcap_set_buffer_size(g_handle, SV_CAP_BUFFER_SIZE);
             if (rc == 0) {
-                printf("[capture] \xe2\x9c\x93 Immediate mode enabled (single-packet delivery)\n");
+                printf("[capture] Kernel buffer size set to %d MB\n", SV_CAP_BUFFER_SIZE / (1024*1024));
             } else {
-                printf("[capture] WARNING: pcap_set_immediate_mode failed (rc=%d)\n", rc);
+                printf("[capture] WARNING: pcap_set_buffer_size failed (rc=%d)\n", rc);
             }
-        } else {
-            printf("[capture] pcap_set_immediate_mode not available\n");
         }
+        
+        /* Step 2b: Immediate mode DISABLED — we use pcap_dispatch() with
+         * buffered delivery to avoid 100% CPU busy-polling.
+         * The OS/driver batches packets and delivers them per timeout interval,
+         * and pcap_dispatch processes the entire batch via callback. */
+        printf("[capture] Immediate mode disabled (using pcap_dispatch buffered delivery)\n");
         
         /* Step 3: Query and set best available timestamp type */
         g_tstamp_type = SV_PCAP_TSTAMP_HOST;  /* Default fallback */
@@ -672,8 +685,11 @@ int sv_capture_open(const char *device_name) {
     
     pcap_set_snaplen(g_handle, SV_CAP_SNAPLEN);
     pcap_set_promisc(g_handle, SV_CAP_PROMISC);
-    pcap_set_timeout(g_handle, SV_CAP_TIMEOUT_MS);  /* 1ms timeout */
-    pcap_set_immediate_mode(g_handle, 1);            /* No buffering */
+    pcap_set_timeout(g_handle, SV_CAP_TIMEOUT_MS);  /* 2ms timeout — pcap_dispatch batched delivery */
+    pcap_set_buffer_size(g_handle, SV_CAP_BUFFER_SIZE); /* 10 MB kernel buffer */
+    /* Immediate mode DISABLED — pcap_dispatch handles batched packet
+     * delivery efficiently without busy-spinning the CPU. */
+    /* pcap_set_immediate_mode(g_handle, 0); — default is already off */
     
     /* Try best available timestamp type: ADAPTER > HOST_HIPREC > HOST */
     int *tstamp_types = nullptr;
@@ -699,7 +715,23 @@ int sv_capture_open(const char *device_name) {
     
     int activate_rc = pcap_activate(g_handle);
     if (activate_rc < 0) {
-        snprintf(g_error, sizeof(g_error), "pcap_activate failed (rc=%d)", activate_rc);
+        const char* pcap_err = pcap_geterr(g_handle);
+        if (activate_rc == -8) {
+            /* PCAP_ERROR_PERM_DENIED */
+            snprintf(g_error, sizeof(g_error),
+                "Permission denied. Raw packet capture requires root or CAP_NET_RAW. "
+                "Run with: sudo ./sv-subscriber  OR  "
+                "sudo setcap cap_net_raw,cap_net_admin=eip <binary>");
+        } else if (activate_rc == -9) {
+            /* PCAP_ERROR_IFACE_NOT_UP */
+            snprintf(g_error, sizeof(g_error),
+                "Interface is not up. Run: sudo ip link set <iface> up");
+        } else {
+            snprintf(g_error, sizeof(g_error),
+                "pcap_activate failed (rc=%d): %s", activate_rc,
+                pcap_err ? pcap_err : "unknown error");
+        }
+        printf("[capture] ERROR: %s\n", g_error);
         pcap_close(g_handle);
         g_handle = nullptr;
         return -1;
@@ -743,21 +775,67 @@ int sv_capture_is_open(void) {
  * Capture Thread
  *============================================================================*/
 
+/*============================================================================
+ * pcap_dispatch Callback — processes each packet in the batch
+ *
+ * Called by pcap_dispatch() for each packet in the kernel buffer.
+ * This replaces the old pcap_next_ex() busy-polling loop to avoid
+ * 100% CPU. The OS batches packets and delivers them per timeout.
+ *============================================================================*/
+
+#ifdef _WIN32
+static void capture_dispatch_cb(unsigned char *user_data,
+                                const struct pcap_pkthdr *header,
+                                const unsigned char *pkt_data) {
+    (void)user_data;
+    g_stat_received.fetch_add(1, std::memory_order_relaxed);
+    g_stat_bytes.fetch_add(header->caplen, std::memory_order_relaxed);
+    
+    if (header->caplen >= 14 && pkt_data) {
+        uint64_t ts_us;
+        if (g_tstamp_nano_active) {
+            ts_us = (uint64_t)header->ts.tv_sec * 1000000ULL
+                  + (uint64_t)header->ts.tv_usec / 1000ULL;
+        } else {
+            ts_us = (uint64_t)header->ts.tv_sec * 1000000ULL
+                  + (uint64_t)header->ts.tv_usec;
+        }
+        int rc = sv_highperf_capture_feed(pkt_data, header->caplen, ts_us);
+        if (rc == 0) {
+            g_stat_sv.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+#else
+static void capture_dispatch_cb(u_char *user_data,
+                                const struct pcap_pkthdr *header,
+                                const u_char *pkt_data) {
+    (void)user_data;
+    g_stat_received.fetch_add(1, std::memory_order_relaxed);
+    g_stat_bytes.fetch_add(header->caplen, std::memory_order_relaxed);
+    
+    if (header->caplen >= 14 && pkt_data) {
+        uint64_t ts_us = (uint64_t)header->ts.tv_sec * 1000000ULL
+                       + (uint64_t)header->ts.tv_usec;
+        int rc = sv_highperf_capture_feed(pkt_data, header->caplen, ts_us);
+        if (rc == 0) g_stat_sv.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+#endif
+
 /**
- * @brief Capture thread function — HIGH PERFORMANCE PATH
+ * @brief Capture thread function — EFFICIENT pcap_dispatch PATH
  * 
- * Uses pcap_next_ex() in a tight polling loop.
- * Packets are decoded inline and pushed to the lock-free SPSC ring
- * via sv_highperf_capture_feed() — NO mutex in this hot path.
+ * Uses pcap_dispatch() with callback-based batch processing.
+ * The OS kernel buffers packets and delivers them every ~10ms (SV_CAP_TIMEOUT_MS).
+ * pcap_dispatch processes ALL buffered packets via the callback in one call,
+ * then sleeps until the next batch — dramatically reducing CPU vs busy-polling.
  *
  * Timestamps come directly from pcap (HOST_HIPREC when available).
- * No QueryPerformanceCounter — pcap provides the timestamp.
- *
- * At 1 Gbps (~1Mpps), this loop must process each packet in < 1μs.
  * The BPF kernel filter ensures only SV frames (0x88BA) reach us.
  */
 static void capture_thread_func() {
-    printf("[capture] Capture thread started (pcap HOST_HIPREC timestamp mode)\n");
+    printf("[capture] Capture thread started (pcap_dispatch mode, timeout=%dms)\n", SV_CAP_TIMEOUT_MS);
     
     g_capture_start_ms = get_time_ms();
     g_stat_received.store(0);
@@ -767,19 +845,9 @@ static void capture_thread_func() {
     
 #ifdef _WIN32
     /* ── Thread priority boost for reliable packet capture ── */
-    timeBeginPeriod(1);  /* Improve Windows timer resolution to 1ms */
+    timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-    printf("[capture] Thread priority: ABOVE_NORMAL, timer resolution: 1ms\n");
-    
-    /*
-     * Direct pcap HOST_HIPREC timestamping.
-     *
-     * Timestamps come directly from Npcap's pcap_next_ex() header.
-     * With HOST_HIPREC set in sv_capture_open(), Npcap uses its
-     * highest-resolution software clock for packet timestamps.
-     *
-     * No QPC overlay — we trust the pcap timestamp as-is.
-     */
+    printf("[capture] Thread priority: ABOVE_NORMAL\n");
     printf("[capture] Using direct pcap timestamps (type=%s, precision=%s)\n",
            g_tstamp_type_name,
            g_tstamp_nano_active ? "nano" : "micro");
@@ -790,65 +858,30 @@ static void capture_thread_func() {
     
     while (g_capturing.load(std::memory_order_relaxed)) {
 #ifdef _WIN32
-        struct pcap_pkthdr* header = nullptr;
-        const unsigned char* pkt_data = nullptr;
+        /* pcap_dispatch: process all buffered packets via callback, then return.
+         * cnt=-1: process all packets from one buffer read.
+         * Blocks up to SV_CAP_TIMEOUT_MS if no packets are available. */
+        int res = g_dispatch(g_handle, -1, capture_dispatch_cb, nullptr);
         
-        int res = g_next_ex(g_handle, &header, &pkt_data);
-        
-        if (res == 1) {
-            /* Packet received — use pcap timestamp directly */
-            g_stat_received.fetch_add(1, std::memory_order_relaxed);
-            g_stat_bytes.fetch_add(header->caplen, std::memory_order_relaxed);
-            
-            if (header->caplen >= 14 && pkt_data) {
-                uint64_t ts_us;
-                
-                if (g_tstamp_nano_active) {
-                    /* Nanosecond precision: tv_usec contains nanoseconds */
-                    ts_us = (uint64_t)header->ts.tv_sec * 1000000ULL 
-                          + (uint64_t)header->ts.tv_usec / 1000ULL;
-                } else {
-                    /* Microsecond precision: tv_usec contains microseconds */
-                    ts_us = (uint64_t)header->ts.tv_sec * 1000000ULL 
-                          + (uint64_t)header->ts.tv_usec;
-                }
-                
-                int rc = sv_highperf_capture_feed(pkt_data, header->caplen, ts_us);
-                if (rc == 0) {
-                    g_stat_sv.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        } else if (res == 0) {
-            continue; /* Timeout */
-        } else if (res == -2) {
+        if (res == -2) {
             printf("[capture] pcap breakloop\n");
             break;
-        } else {
-            printf("[capture] pcap_next_ex error: %d\n", res);
+        } else if (res < 0) {
+            printf("[capture] pcap_dispatch error: %d\n", res);
             break;
         }
-        
+        /* res == 0 means timeout (no packets) — loop continues */
 #else
-        struct pcap_pkthdr* header;
-        const u_char* pkt_data;
-        
-        int res = pcap_next_ex(g_handle, &header, &pkt_data);
-        
-        if (res == 1) {
-            g_stat_received.fetch_add(1, std::memory_order_relaxed);
-            g_stat_bytes.fetch_add(header->caplen, std::memory_order_relaxed);
-            
-            if (header->caplen >= 14 && pkt_data) {
-                uint64_t ts_us = (uint64_t)header->ts.tv_sec * 1000000ULL
-                               + (uint64_t)header->ts.tv_usec;
+        int res = pcap_dispatch(g_handle, -1, capture_dispatch_cb, nullptr);
 
-                int rc = sv_highperf_capture_feed(pkt_data, header->caplen, ts_us);
-                if (rc == 0) g_stat_sv.fetch_add(1, std::memory_order_relaxed);
-            }
-        } else if (res == 0) {
-            continue;
-        } else {
+        if (res == PCAP_ERROR_BREAK) {
             break;
+        } else if (res < 0) {
+            printf("[capture] pcap_dispatch error: %d — %s\n", res, pcap_geterr(g_handle));
+            break;
+        } else if (res == 0) {
+            /* No packets — yield CPU instead of spinning */
+            std::this_thread::sleep_for(std::chrono::milliseconds(SV_CAP_TIMEOUT_MS));
         }
 #endif
     }

@@ -489,11 +489,14 @@ static void drain_thread_func() {
         g_hp_drain_total.fetch_add(to_process, std::memory_order_relaxed);
         g_hp_drain_batches.fetch_add(1, std::memory_order_relaxed);
         
-        /* Sleep remainder of interval */
+        /* Sleep remainder of interval.
+         * Always sleep at least 1ms even when batch was full — prevents
+         * the drain thread from burning 100% CPU when the publisher is fast. */
         if (to_process < (uint64_t)SV_DRAIN_BATCH_MAX) {
             std::this_thread::sleep_for(std::chrono::milliseconds(SV_DRAIN_INTERVAL_MS));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        /* If batch was full, loop immediately without sleep — we're behind */
     }
     
     /* Final drain: process everything remaining */
