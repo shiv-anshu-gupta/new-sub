@@ -21,7 +21,7 @@ extern "C" {
 
 #define SV_CAP_SNAPLEN      65536
 #define SV_CAP_PROMISC      1
-#define SV_CAP_TIMEOUT_MS   10    /* pcap read timeout (ms) */
+#define SV_CAP_TIMEOUT_MS   10   /* pcap read timeout — balances latency vs CPU */
 
 /* ── Callback type ───────────────────────────────────────────────────────── */
 

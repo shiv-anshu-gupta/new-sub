@@ -19,9 +19,9 @@ struct SvCapture {
 
 /* ── pcap callback adapter ───────────────────────────────────────────────── */
 
-static void pcap_handler(u_char *user,
-                         const struct pcap_pkthdr *hdr,
-                         const u_char *pkt)
+static void sv_pcap_handler(u_char *user,
+                            const struct pcap_pkthdr *hdr,
+                            const u_char *pkt)
 {
     SvCapture *cap = reinterpret_cast<SvCapture *>(user);
     uint64_t ts_us = static_cast<uint64_t>(hdr->ts.tv_sec) * 1000000ULL
@@ -86,8 +86,8 @@ int sv_capture_run(SvCapture *cap, sv_packet_cb cb, void *user_data)
        read timeout period, blocking when idle. No busy loop. */
     for (;;) {
         int n = pcap_dispatch(cap->pcap, 0,
-                              pcap_handler,
-                              reinterpret_cast<u_char *>(cap));
+                      sv_pcap_handler,
+                      reinterpret_cast<u_char *>(cap));
         if (n == PCAP_ERROR_BREAK) return 0;   /* sv_capture_stop() called */
         if (n == PCAP_ERROR) {
             std::fprintf(stderr, "pcap_dispatch: %s\n", pcap_geterr(cap->pcap));
