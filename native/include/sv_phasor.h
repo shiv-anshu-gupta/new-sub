@@ -1,23 +1,14 @@
 /**
  * @file sv_phasor.h
- * @brief Real-Time Phasor Estimation using Intel MKL FFT
+ * @brief DFT-based phasor estimation for SV channel data
  *
- * Implements two DFT-based phasor computation modes:
- *   Task 1: Half-cycle window (N/2 samples), jump half-cycle
- *   Task 2: Full-cycle window (N samples), jump full-cycle
+ * Computes magnitude + phase angle from buffered samples using
+ * a simple DFT at the fundamental frequency bin.
  *
- * Uses Intel MKL DFTI for hardware-accelerated FFT.
+ * Optionally uses Intel MKL for FFT when ENABLE_MKL is defined.
+ * Falls back to a direct Goertzel single-bin DFT otherwise.
  *
- * Phasor = Magnitude (peak) + Angle (degrees)
- *   For a signal x[n] = A·cos(ωn + φ):
- *     Magnitude = A (peak value, same unit as raw samples)
- *     Angle     = φ (degrees, -180° to +180°)
- *
- * Data flow:
- *   Raw samples (int32_t[]) → sv_phasor_feed_sample()
- *     → buffer fills up to window_size
- *     → MKL FFT → extract fundamental bin
- *     → PhasorResult (mag + angle per channel)
+ * Build with: -DENABLE_PHASOR to include this module.
  */
 
 #ifndef SV_PHASOR_H
@@ -29,100 +20,54 @@
 extern "C" {
 #endif
 
-/*============================================================================
- * Constants
- *============================================================================*/
+/* ── Constants ───────────────────────────────────────────────────────────── */
 
-#define PHASOR_MAX_CHANNELS     20      /**< Max channels to process */
-#define PHASOR_MAX_WINDOW_SIZE  256     /**< Max samples per cycle (256 spc systems) */
+#define PHASOR_MAX_CHANNELS     20
+#define PHASOR_MAX_WINDOW       256
 
-/** Phasor computation modes */
-#define PHASOR_MODE_HALF_CYCLE  0       /**< Task 1: ½ cycle window, jump ½ cycle */
-#define PHASOR_MODE_FULL_CYCLE  1       /**< Task 2: 1 cycle window, jump 1 cycle */
+/* ── Data structures ─────────────────────────────────────────────────────── */
 
-/*============================================================================
- * Data Structures
- *============================================================================*/
-
-/**
- * @brief Single-channel phasor value
- */
 typedef struct {
-    double magnitude;       /**< Peak magnitude (same unit as raw input) */
-    double angle_deg;       /**< Phase angle in degrees (-180 to +180) */
+    double magnitude;       /**< Peak magnitude */
+    double angle_deg;       /**< Phase angle in degrees (-180..+180) */
 } SvPhasorValue;
 
-/**
- * @brief Complete phasor computation result (all channels)
- */
 typedef struct {
     SvPhasorValue channels[PHASOR_MAX_CHANNELS];
-    uint8_t     channelCount;       /**< Number of channels computed */
-    uint8_t     valid;              /**< 1 = result available, 0 = still buffering */
-    uint8_t     mode;               /**< Current mode: PHASOR_MODE_* */
-    uint32_t    windowSize;         /**< Samples used for this computation */
-    uint32_t    samplesPerCycle;    /**< Full cycle sample count (e.g., 80) */
-    uint32_t    computeCount;       /**< Total FFTs computed since init */
-    uint64_t    timestamp_us;       /**< Timestamp of last sample in window */
+    uint8_t     channel_count;
+    uint8_t     valid;          /**< 1 when result is ready */
+    uint32_t    window_size;
+    uint64_t    timestamp_us;
 } SvPhasorResult;
 
-/*============================================================================
- * API
- *============================================================================*/
+/* Opaque engine handle */
+typedef struct SvPhasorEngine SvPhasorEngine;
+
+/* ── API ─────────────────────────────────────────────────────────────────── */
 
 /**
- * @brief Initialize the phasor computation engine
- *
- * Creates MKL FFT descriptor and pre-allocates buffers.
- * Must be called before feeding samples.
- *
- * @param samplesPerCycle  Samples per full power cycle (e.g., 80 for 4800Hz@60Hz)
- * @param maxChannels      Number of channels to process (typically 8)
- * @param mode             PHASOR_MODE_HALF_CYCLE or PHASOR_MODE_FULL_CYCLE
- * @return 0 on success, -1 on failure (MKL init error)
+ * Create a phasor engine.
+ * samples_per_cycle: e.g. 80 for 4800 smp/s @ 60 Hz.
+ * max_channels:      how many channels to process.
+ * Returns NULL on failure.
  */
-int sv_phasor_init(uint16_t samplesPerCycle, uint8_t maxChannels, uint8_t mode);
+SvPhasorEngine *sv_phasor_create(uint16_t samples_per_cycle, uint8_t max_channels);
 
 /**
- * @brief Feed one sample (all channels) to the phasor engine
- *
- * Buffers samples until window is full, then automatically computes FFT.
- *
- * @param values        Channel values array (int32_t, raw from SV packet)
- * @param channelCount  Number of valid channels in values[]
- * @param timestamp_us  Sample timestamp (microseconds)
- * @return 1 if a new phasor result was computed, 0 if still buffering, -1 on error
+ * Feed one sample (all channels).
+ * Returns 1 if a new result was computed, 0 if still buffering, -1 on error.
  */
-int sv_phasor_feed_sample(const int32_t *values, uint8_t channelCount, uint64_t timestamp_us);
+int sv_phasor_feed(SvPhasorEngine *eng, const int32_t *values,
+                   uint8_t channel_count, uint64_t timestamp_us);
 
-/**
- * @brief Get the latest phasor computation result
- *
- * Returns pointer to internal result struct. Valid until next computation.
- *
- * @return Pointer to latest result (always valid, check .valid field)
- */
-const SvPhasorResult* sv_phasor_get_result(void);
+/** Get latest result (valid until next computation). */
+const SvPhasorResult *sv_phasor_result(const SvPhasorEngine *eng);
 
-/**
- * @brief Change the computation mode
- *
- * Switches between half-cycle and full-cycle DFT.
- * Resets the sample buffer (current partial window is discarded).
- *
- * @param mode  PHASOR_MODE_HALF_CYCLE or PHASOR_MODE_FULL_CYCLE
- */
-void sv_phasor_set_mode(uint8_t mode);
+/** Reset buffers, keep configuration. */
+void sv_phasor_reset(SvPhasorEngine *eng);
 
-/**
- * @brief Reset the phasor engine (clear buffers, keep configuration)
- */
-void sv_phasor_reset(void);
-
-/**
- * @brief Destroy the phasor engine (free MKL resources)
- */
-void sv_phasor_destroy(void);
+/** Destroy engine and free resources. */
+void sv_phasor_destroy(SvPhasorEngine *eng);
 
 #ifdef __cplusplus
 }

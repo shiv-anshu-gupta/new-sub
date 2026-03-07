@@ -1,331 +1,179 @@
 /**
  * @file sv_phasor.cc
- * @brief Real-Time Phasor Estimation using Intel MKL FFT
+ * @brief Phasor estimation via Goertzel algorithm (no MKL dependency).
  *
- * Implements Task 1 (half-cycle DFT) and Task 2 (full-cycle DFT) for
- * IEC 61850 Sampled Values phasor extraction.
+ * When ENABLE_MKL is defined, uses Intel MKL FFT instead.
+ * Otherwise, uses a single-bin Goertzel DFT for the fundamental — fast,
+ * dependency-free, and perfectly accurate for phasor extraction.
  *
- * Algorithm:
- *   1. Buffer incoming raw samples per channel
- *   2. When window is full (40 or 80 samples):
- *      a. Copy samples to FFT input buffer (convert int32 → double)
- *      b. Zero-pad to full cycle size (for half-window mode)
- *      c. Run MKL complex FFT (real samples with imaginary = 0)
- *      d. Extract fundamental frequency bin (bin 1)
- *      e. Compute magnitude = 2·|X[1]| / window_size
- *      f. Compute angle = atan2(Im(X[1]), Re(X[1]))
- *   3. Store result and make available via sv_phasor_get_result()
- *
- * MKL FFT details:
- *   - DFTI_DOUBLE precision, DFTI_COMPLEX domain
- *   - Inplace complex-to-complex transform
- *   - Input: real samples stored as complex (imaginary = 0)
- *   - Output: array of N complex numbers [Re(X[0]),Im(X[0]), Re(X[1]),Im(X[1]), ...]
- *   - FFT size = samplesPerCycle (always full cycle for correct bin alignment)
- *   - Fundamental at bin 1: Re = buf[2], Im = buf[3]
+ * Build: compiled only when -DENABLE_PHASOR is passed to CMake.
  */
 
 #include "sv_phasor.h"
-#include <mkl_dfti.h>
-#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <cstdio>
+
+#ifdef ENABLE_MKL
+#include <mkl_dfti.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-/*============================================================================
- * Module State
- *============================================================================*/
+/* ── Internal engine state ───────────────────────────────────────────────── */
 
-/** Configuration */
-static uint16_t g_samples_per_cycle = 80;   /**< Full cycle sample count */
-static uint8_t  g_max_channels = 8;         /**< Channels to process */
-static uint8_t  g_mode = PHASOR_MODE_FULL_CYCLE;
-static uint32_t g_window_size = 80;         /**< Actual samples to collect per computation */
+struct SvPhasorEngine {
+    uint16_t    samples_per_cycle;
+    uint8_t     max_channels;
 
-/** Sample buffer: [channel][sample_index] */
-static double   g_sample_buf[PHASOR_MAX_CHANNELS][PHASOR_MAX_WINDOW_SIZE];
-static uint32_t g_buf_pos = 0;              /**< Current position in sample buffer */
-static uint64_t g_last_ts = 0;              /**< Timestamp of most recent sample */
+    /* per-channel ring buffer: [channel][sample] */
+    double      buf[PHASOR_MAX_CHANNELS][PHASOR_MAX_WINDOW];
+    uint32_t    buf_pos;
 
-/** MKL FFT */
-static DFTI_DESCRIPTOR_HANDLE g_fft_handle = NULL;
-static double   g_fft_work[2 * PHASOR_MAX_WINDOW_SIZE]; /**< Complex FFT buffer: [Re0,Im0,Re1,Im1,...] */
+    SvPhasorResult result;
 
-/** Result */
-static SvPhasorResult g_result;
-static uint32_t g_compute_count = 0;
-static uint8_t  g_initialized = 0;
+#ifdef ENABLE_MKL
+    DFTI_DESCRIPTOR_HANDLE fft_handle;
+    double      fft_work[2 * PHASOR_MAX_WINDOW]; /* complex interleaved */
+#endif
+};
 
-/*============================================================================
- * Internal: MKL FFT Setup
- *============================================================================*/
+/* ── Goertzel single-bin DFT ─────────────────────────────────────────────── */
 
+#ifndef ENABLE_MKL
 /**
- * @brief Create/recreate the MKL FFT descriptor
- *
- * Uses DFTI_COMPLEX domain to avoid packed-format compatibility issues
- * across MKL versions. Real input is stored with imaginary = 0.
- *
- * FFT size is always samplesPerCycle (full cycle) regardless of window mode.
- * For half-cycle mode, we zero-pad the input to full cycle size.
- * This ensures bin 1 always corresponds to the fundamental frequency.
+ * Compute magnitude and phase of bin k in a length-N real signal.
+ * For the fundamental: k = 1.
  */
-static int create_fft_descriptor(void)
+static void goertzel(const double *x, uint32_t N, uint32_t k,
+                     double *mag, double *angle_deg)
 {
-    /* Free existing descriptor */
-    if (g_fft_handle) {
-        DftiFreeDescriptor(&g_fft_handle);
-        g_fft_handle = NULL;
+    double w = 2.0 * M_PI * k / N;
+    double coeff = 2.0 * std::cos(w);
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0;
+
+    for (uint32_t i = 0; i < N; ++i) {
+        s0 = x[i] + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
     }
 
-    MKL_LONG N = (MKL_LONG)g_samples_per_cycle;
-    MKL_LONG status;
+    double re = s1 - s2 * std::cos(w);
+    double im = s2 * std::sin(w);
 
-    /* Create complex-to-complex FFT descriptor, double precision.
-     * Using DFTI_COMPLEX avoids DFTI_REAL packed-format issues
-     * (DFTI_PACK_FORMAT + DFTI_INPLACE = INCONSISTENT_CONFIGURATION in some MKL versions).
-     * Real samples are stored as complex with imaginary = 0. */
-    status = DftiCreateDescriptor(&g_fft_handle, DFTI_DOUBLE, DFTI_COMPLEX, 1, N);
-    if (status != DFTI_NO_ERROR) {
-        printf("[phasor] ERROR: MKL DftiCreateDescriptor failed (status=%lld, N=%lld)\n",
-               (long long)status, (long long)N);
-        return -1;
-    }
-
-    /* Commit (finalize) the descriptor — MKL optimizes the FFT plan */
-    status = DftiCommitDescriptor(g_fft_handle);
-    if (status != DFTI_NO_ERROR) {
-        printf("[phasor] ERROR: MKL DftiCommitDescriptor failed: %lld\n", (long long)status);
-        DftiFreeDescriptor(&g_fft_handle);
-        g_fft_handle = NULL;
-        return -1;
-    }
-
-    printf("[phasor] MKL FFT descriptor created (COMPLEX, N=%lld)\n", (long long)N);
-    return 0;
+    double raw = std::sqrt(re * re + im * im);
+    *mag       = 2.0 * raw / N;
+    *angle_deg = std::atan2(im, re) * (180.0 / M_PI);
 }
+#endif
 
-/*============================================================================
- * Internal: Compute Phasor from Buffered Samples
- *============================================================================*/
+/* ── Compute phasors for all channels ────────────────────────────────────── */
 
-/**
- * @brief Run FFT on all channels and extract fundamental phasor
- *
- * For each channel:
- *   1. Copy window_size samples as complex input (real part = sample, imag = 0)
- *   2. Zero-pad remaining (if half-window mode)
- *   3. Run MKL complex FFT inplace
- *   4. Extract bin 1 (fundamental): Re = buf[2], Im = buf[3]
- *   5. Compute magnitude and angle
- */
-static void compute_phasors(void)
+static void compute(SvPhasorEngine *eng)
 {
-    if (!g_fft_handle) return;
+    uint32_t N   = eng->samples_per_cycle;
+    uint8_t  nch = eng->max_channels;
 
-    uint32_t N = g_samples_per_cycle;   /* FFT size (always full cycle) */
-    uint32_t W = g_window_size;         /* Actual signal samples (40 or 80) */
-    uint8_t nch = g_max_channels;
-
-    for (uint8_t ch = 0; ch < nch; ch++) {
-        /* 1. Fill FFT input as complex: [Re0,Im0, Re1,Im1, ...]
-         *    Real part = sample value, Imaginary = 0 */
-        for (uint32_t i = 0; i < W; i++) {
-            g_fft_work[2 * i]     = g_sample_buf[ch][i];  /* Real */
-            g_fft_work[2 * i + 1] = 0.0;                   /* Imaginary */
+#ifdef ENABLE_MKL
+    for (uint8_t ch = 0; ch < nch; ++ch) {
+        for (uint32_t i = 0; i < N; ++i) {
+            eng->fft_work[2 * i]     = eng->buf[ch][i];
+            eng->fft_work[2 * i + 1] = 0.0;
         }
-
-        /* 2. Zero-pad remaining (for half-window: samples W..N-1 = 0+0j) */
-        for (uint32_t i = W; i < N; i++) {
-            g_fft_work[2 * i]     = 0.0;
-            g_fft_work[2 * i + 1] = 0.0;
-        }
-
-        /* 3. Run MKL complex FFT (inplace — g_fft_work is overwritten with output) */
-        MKL_LONG status = DftiComputeForward(g_fft_handle, g_fft_work);
-        if (status != DFTI_NO_ERROR) {
-            /* FFT failed — zero out this channel's result */
-            g_result.channels[ch].magnitude = 0.0;
-            g_result.channels[ch].angle_deg = 0.0;
+        MKL_LONG st = DftiComputeForward(eng->fft_handle, eng->fft_work);
+        if (st != DFTI_NO_ERROR) {
+            eng->result.channels[ch] = {0.0, 0.0};
             continue;
         }
-
-        /* 4. Extract fundamental (bin 1) from complex output
-         *    Complex output: [Re(X[0]),Im(X[0]), Re(X[1]),Im(X[1]), ...]
-         *    Bin 1 (fundamental): Re = output[2], Im = output[3]
-         */
-        double re = g_fft_work[2];   /* Real part of X[1] */
-        double im = g_fft_work[3];   /* Imag part of X[1] */
-
-        /* 5. Compute magnitude and angle
-         *    |X[1]| = sqrt(Re² + Im²)
-         *    Peak magnitude = 2·|X[1]| / W  (scale by actual sample count, not FFT size)
-         *    Angle = atan2(Im, Re) → convert to degrees
-         */
-        double mag_raw = sqrt(re * re + im * im);
-        double magnitude = 2.0 * mag_raw / (double)W;
-        double angle_rad = atan2(im, re);
-        double angle_deg = angle_rad * (180.0 / M_PI);
-
-        g_result.channels[ch].magnitude = magnitude;
-        g_result.channels[ch].angle_deg = angle_deg;
+        double re = eng->fft_work[2];
+        double im = eng->fft_work[3];
+        double raw = std::sqrt(re * re + im * im);
+        eng->result.channels[ch].magnitude = 2.0 * raw / N;
+        eng->result.channels[ch].angle_deg = std::atan2(im, re) * (180.0 / M_PI);
     }
+#else
+    for (uint8_t ch = 0; ch < nch; ++ch) {
+        goertzel(eng->buf[ch], N, 1,
+                 &eng->result.channels[ch].magnitude,
+                 &eng->result.channels[ch].angle_deg);
+    }
+#endif
 
-    /* Update result metadata */
-    g_result.channelCount = nch;
-    g_result.valid = 1;
-    g_result.mode = g_mode;
-    g_result.windowSize = W;
-    g_result.samplesPerCycle = N;
-    g_result.timestamp_us = g_last_ts;
-    g_compute_count++;
-    g_result.computeCount = g_compute_count;
+    eng->result.channel_count = nch;
+    eng->result.valid         = 1;
+    eng->result.window_size   = N;
 }
 
-/*============================================================================
- * Public API
- *============================================================================*/
+/* ── Public API ──────────────────────────────────────────────────────────── */
 
-int sv_phasor_init(uint16_t samplesPerCycle, uint8_t maxChannels, uint8_t mode)
+SvPhasorEngine *sv_phasor_create(uint16_t samples_per_cycle, uint8_t max_channels)
 {
-    if (samplesPerCycle == 0 || samplesPerCycle > PHASOR_MAX_WINDOW_SIZE) {
-        printf("[phasor] ERROR: invalid samplesPerCycle=%u (must be 1..%d)\n",
-               samplesPerCycle, PHASOR_MAX_WINDOW_SIZE);
-        return -1;
+    if (samples_per_cycle == 0 || samples_per_cycle > PHASOR_MAX_WINDOW) return nullptr;
+    if (max_channels > PHASOR_MAX_CHANNELS) max_channels = PHASOR_MAX_CHANNELS;
+
+    auto *eng = static_cast<SvPhasorEngine *>(std::calloc(1, sizeof(SvPhasorEngine)));
+    if (!eng) return nullptr;
+
+    eng->samples_per_cycle = samples_per_cycle;
+    eng->max_channels      = max_channels;
+
+#ifdef ENABLE_MKL
+    MKL_LONG N = samples_per_cycle;
+    if (DftiCreateDescriptor(&eng->fft_handle, DFTI_DOUBLE, DFTI_COMPLEX, 1, N) != DFTI_NO_ERROR ||
+        DftiCommitDescriptor(eng->fft_handle) != DFTI_NO_ERROR) {
+        std::fprintf(stderr, "[phasor] MKL FFT init failed\n");
+        std::free(eng);
+        return nullptr;
     }
-    if (maxChannels > PHASOR_MAX_CHANNELS) {
-        maxChannels = PHASOR_MAX_CHANNELS;
+#endif
+
+    return eng;
+}
+
+int sv_phasor_feed(SvPhasorEngine *eng, const int32_t *values,
+                   uint8_t channel_count, uint64_t timestamp_us)
+{
+    if (!eng || !values) return -1;
+
+    uint8_t nch = channel_count < eng->max_channels ? channel_count : eng->max_channels;
+
+    for (uint8_t ch = 0; ch < nch; ++ch)
+        eng->buf[ch][eng->buf_pos] = static_cast<double>(values[ch]);
+    for (uint8_t ch = nch; ch < eng->max_channels; ++ch)
+        eng->buf[ch][eng->buf_pos] = 0.0;
+
+    eng->buf_pos++;
+    eng->result.timestamp_us = timestamp_us;
+
+    if (eng->buf_pos >= eng->samples_per_cycle) {
+        compute(eng);
+        eng->buf_pos = 0;
+        return 1;
     }
-
-    g_samples_per_cycle = samplesPerCycle;
-    g_max_channels = maxChannels;
-    g_mode = mode;
-
-    /* Set window size based on mode */
-    if (mode == PHASOR_MODE_HALF_CYCLE) {
-        g_window_size = samplesPerCycle / 2;
-    } else {
-        g_window_size = samplesPerCycle; /* FULL_CYCLE */
-    }
-
-    /* Reset buffers */
-    memset(g_sample_buf, 0, sizeof(g_sample_buf));
-    g_buf_pos = 0;
-    g_last_ts = 0;
-    g_compute_count = 0;
-    memset(&g_result, 0, sizeof(g_result));
-    g_result.samplesPerCycle = samplesPerCycle;
-    g_result.mode = mode;
-    g_result.windowSize = g_window_size;
-    g_result.channelCount = maxChannels;
-
-    /* Create MKL FFT descriptor */
-    if (create_fft_descriptor() != 0) {
-        printf("[phasor] ERROR: Failed to create MKL FFT — phasor disabled\n");
-        g_initialized = 0;
-        return -1;
-    }
-
-    g_initialized = 1;
-    printf("[phasor] Initialized: samplesPerCycle=%u, channels=%u, mode=%s, windowSize=%u\n",
-           samplesPerCycle, maxChannels,
-           mode == PHASOR_MODE_HALF_CYCLE ? "HALF_CYCLE" : "FULL_CYCLE",
-           g_window_size);
     return 0;
 }
 
-int sv_phasor_feed_sample(const int32_t *values, uint8_t channelCount, uint64_t timestamp_us)
+const SvPhasorResult *sv_phasor_result(const SvPhasorEngine *eng)
 {
-    if (!g_initialized || !g_fft_handle) return -1;
-    if (!values) return -1;
-
-    /* Limit channels to configured max */
-    uint8_t nch = (channelCount < g_max_channels) ? channelCount : g_max_channels;
-
-    /* Store this sample into per-channel buffers */
-    for (uint8_t ch = 0; ch < nch; ch++) {
-        g_sample_buf[ch][g_buf_pos] = (double)values[ch];
-    }
-    /* Zero out remaining channels if this frame has fewer */
-    for (uint8_t ch = nch; ch < g_max_channels; ch++) {
-        g_sample_buf[ch][g_buf_pos] = 0.0;
-    }
-
-    g_buf_pos++;
-    g_last_ts = timestamp_us;
-
-    /* Check if window is full */
-    if (g_buf_pos >= g_window_size) {
-        /* ── Window complete — compute FFT for all channels ── */
-        compute_phasors();
-
-        /* Reset buffer for next window (non-overlapping: jump by window_size) */
-        g_buf_pos = 0;
-
-        return 1; /* New result available */
-    }
-
-    return 0; /* Still buffering */
+    return eng ? &eng->result : nullptr;
 }
 
-const SvPhasorResult* sv_phasor_get_result(void)
+void sv_phasor_reset(SvPhasorEngine *eng)
 {
-    return &g_result;
+    if (!eng) return;
+    eng->buf_pos = 0;
+    std::memset(eng->buf, 0, sizeof(eng->buf));
+    std::memset(&eng->result, 0, sizeof(eng->result));
 }
 
-void sv_phasor_set_mode(uint8_t mode)
+void sv_phasor_destroy(SvPhasorEngine *eng)
 {
-    if (mode > PHASOR_MODE_FULL_CYCLE) mode = PHASOR_MODE_FULL_CYCLE;
-
-    g_mode = mode;
-
-    if (mode == PHASOR_MODE_HALF_CYCLE) {
-        g_window_size = g_samples_per_cycle / 2;
-    } else {
-        g_window_size = g_samples_per_cycle;
-    }
-
-    /* Discard current partial window */
-    g_buf_pos = 0;
-
-    /* Update result metadata */
-    g_result.mode = mode;
-    g_result.windowSize = g_window_size;
-
-    printf("[phasor] Mode changed: %s (windowSize=%u)\n",
-           mode == PHASOR_MODE_HALF_CYCLE ? "HALF_CYCLE" : "FULL_CYCLE",
-           g_window_size);
-}
-
-void sv_phasor_reset(void)
-{
-    g_buf_pos = 0;
-    g_last_ts = 0;
-    g_compute_count = 0;
-    memset(g_sample_buf, 0, sizeof(g_sample_buf));
-    memset(&g_result, 0, sizeof(g_result));
-    g_result.samplesPerCycle = g_samples_per_cycle;
-    g_result.mode = g_mode;
-    g_result.windowSize = g_window_size;
-
-    printf("[phasor] Reset (mode=%s, windowSize=%u)\n",
-           g_mode == PHASOR_MODE_HALF_CYCLE ? "HALF_CYCLE" : "FULL_CYCLE",
-           g_window_size);
-}
-
-void sv_phasor_destroy(void)
-{
-    if (g_fft_handle) {
-        DftiFreeDescriptor(&g_fft_handle);
-        g_fft_handle = NULL;
-    }
-    g_initialized = 0;
-    g_buf_pos = 0;
-    g_compute_count = 0;
-    memset(&g_result, 0, sizeof(g_result));
-
-    printf("[phasor] Destroyed\n");
+    if (!eng) return;
+#ifdef ENABLE_MKL
+    if (eng->fft_handle) DftiFreeDescriptor(&eng->fft_handle);
+#endif
+    std::free(eng);
 }

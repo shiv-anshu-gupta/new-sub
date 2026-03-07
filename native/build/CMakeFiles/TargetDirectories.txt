@@ -1,7 +1,0 @@
-C:/Users/shiva/OneDrive/Desktop/SV-Sub/native/build/CMakeFiles/sv_subscriber_static.dir
-C:/Users/shiva/OneDrive/Desktop/SV-Sub/native/build/CMakeFiles/sv_subscriber_shared.dir
-C:/Users/shiva/OneDrive/Desktop/SV-Sub/native/build/CMakeFiles/sv_decoder_test.dir
-C:/Users/shiva/OneDrive/Desktop/SV-Sub/native/build/CMakeFiles/sv_capture_test.dir
-C:/Users/shiva/OneDrive/Desktop/SV-Sub/native/build/CMakeFiles/INSTALL.dir
-C:/Users/shiva/OneDrive/Desktop/SV-Sub/native/build/CMakeFiles/ALL_BUILD.dir
-C:/Users/shiva/OneDrive/Desktop/SV-Sub/native/build/CMakeFiles/ZERO_CHECK.dir
