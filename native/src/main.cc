@@ -17,6 +17,7 @@
 #include "sv_phasor.h"
 #endif
 
+#include <pcap/pcap.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,12 +29,39 @@
 
 static SvCapture   *g_cap = nullptr;
 static FILE        *g_csv = nullptr;
+static const char  *g_csv_path = nullptr;
+static size_t       g_csv_bytes = 0;
+static size_t       g_csv_max_bytes = 100ULL * 1024 * 1024;  /* default 100 MB */
 static std::mutex   g_out_mtx;
 static uint64_t     g_frame_count = 0;
 
 #ifdef ENABLE_PHASOR
 static SvPhasorEngine *g_phasor = nullptr;
 #endif
+
+/* ── CSV helpers ──────────────────────────────────────────────────────────── */
+
+static void csv_write_header(void)
+{
+    std::fprintf(g_csv, "timestamp_us,svID,smpCnt,confRev,smpSynch,channelCount\n");
+    g_csv_bytes = std::ftell(g_csv);
+}
+
+/** Truncate and restart the CSV file when it exceeds the size limit. */
+static void csv_rotate_if_needed(void)
+{
+    if (!g_csv || g_csv_bytes < g_csv_max_bytes) return;
+
+    std::fclose(g_csv);
+    g_csv = std::fopen(g_csv_path, "w");
+    if (!g_csv) {
+        std::fprintf(stderr, "Warning: failed to rotate CSV, disabling output\n");
+        return;
+    }
+    csv_write_header();
+    std::fprintf(stderr, "[csv] File rotated (exceeded %zu MB limit)\n",
+                 g_csv_max_bytes / (1024 * 1024));
+}
 
 /* ── Signal handler ──────────────────────────────────────────────────────── */
 
@@ -73,12 +101,19 @@ static void on_packet(const uint8_t *buffer, size_t length,
 
         /* CSV output */
         if (g_csv) {
-            std::fprintf(g_csv, "%" PRIu64 ",%s,%u,%u,%u,%u",
-                         ts_us, a->sv_id, a->smp_cnt, a->conf_rev,
-                         a->smp_synch, a->channel_count);
-            for (uint8_t ch = 0; ch < a->channel_count; ++ch)
-                std::fprintf(g_csv, ",%d,%u", a->values[ch], a->quality[ch]);
-            std::fputc('\n', g_csv);
+            csv_rotate_if_needed();
+            if (g_csv) {
+                int n = std::fprintf(g_csv, "%" PRIu64 ",%s,%u,%u,%u,%u",
+                             ts_us, a->sv_id, a->smp_cnt, a->conf_rev,
+                             a->smp_synch, a->channel_count);
+                if (n > 0) g_csv_bytes += n;
+                for (uint8_t ch = 0; ch < a->channel_count; ++ch) {
+                    n = std::fprintf(g_csv, ",%d,%u", a->values[ch], a->quality[ch]);
+                    if (n > 0) g_csv_bytes += n;
+                }
+                std::fputc('\n', g_csv);
+                g_csv_bytes += 1;
+            }
         }
 
 #ifdef ENABLE_PHASOR
@@ -100,25 +135,91 @@ static void on_packet(const uint8_t *buffer, size_t length,
     }
 }
 
+/* ── List interfaces ──────────────────────────────────────────────────────── */
+
+static int list_interfaces(void)
+{
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_if_t *alldevs = nullptr;
+
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        std::fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
+        return -1;
+    }
+
+    if (!alldevs) {
+        std::fprintf(stderr, "No interfaces found (are you root?)\n");
+        return -1;
+    }
+
+    std::fprintf(stderr, "Available interfaces:\n");
+    int idx = 1;
+    for (pcap_if_t *d = alldevs; d; d = d->next, ++idx) {
+        std::fprintf(stderr, "  %d) %s", idx, d->name);
+        if (d->description)
+            std::fprintf(stderr, "  (%s)", d->description);
+        std::fputc('\n', stderr);
+    }
+
+    pcap_freealldevs(alldevs);
+    return 0;
+}
+
+/** Resolve interface by index number (1-based). Returns device name or NULL. */
+static const char *resolve_interface(const char *input, char *buf, size_t buf_len)
+{
+    /* Check if input is a number */
+    char *end = nullptr;
+    long idx = std::strtol(input, &end, 10);
+    if (*end != '\0' || idx <= 0)
+        return input;  /* Not a number — treat as interface name */
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_if_t *alldevs = nullptr;
+
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        std::fprintf(stderr, "Error: pcap_findalldevs: %s\n", errbuf);
+        return nullptr;
+    }
+
+    int i = 1;
+    for (pcap_if_t *d = alldevs; d; d = d->next, ++i) {
+        if (i == idx) {
+            std::snprintf(buf, buf_len, "%s", d->name);
+            pcap_freealldevs(alldevs);
+            return buf;
+        }
+    }
+
+    std::fprintf(stderr, "Error: interface index %ld out of range (1..%d)\n",
+                 idx, i - 1);
+    pcap_freealldevs(alldevs);
+    return nullptr;
+}
+
 /* ── CLI parsing ─────────────────────────────────────────────────────────── */
 
 struct Options {
     const char *interface_name;
     const char *filter;
     const char *csv_path;
-    uint16_t    phasor_spc;     /* samples per cycle (0 = disabled) */
-    uint8_t     phasor_ch;      /* channels for phasor (default 8) */
+    size_t      csv_max_mb;     /* max CSV size in MB (0 = default 100) */
+    bool        list_only;
+    uint16_t    phasor_spc;
+    uint8_t     phasor_ch;
 };
 
 static void print_usage(const char *prog)
 {
     std::fprintf(stderr,
-        "Usage: %s --interface <name> [options]\n"
+        "Usage: %s --interface <name|index> [options]\n"
         "\n"
         "Options:\n"
-        "  --interface <name>   Network interface (required)\n"
+        "  --interface <name|#> Network interface name or index number\n"
+        "  --list               List available interfaces and exit\n"
         "  --filter <bpf>       BPF filter (default: \"ether proto 0x88ba\")\n"
         "  --csv <path>         Write decoded samples to CSV file\n"
+        "  --csv-max-mb <N>     Max CSV size in MB before overwrite (default: 100)\n"
 #ifdef ENABLE_PHASOR
         "  --phasor <spc>       Enable phasor (samples per cycle, e.g. 80)\n"
         "  --phasor-ch <n>      Phasor channel count (default 8)\n"
@@ -135,10 +236,14 @@ static int parse_args(int argc, char **argv, Options *opts)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--interface") == 0 && i + 1 < argc) {
             opts->interface_name = argv[++i];
+        } else if (std::strcmp(argv[i], "--list") == 0) {
+            opts->list_only = true;
         } else if (std::strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
             opts->filter = argv[++i];
         } else if (std::strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
             opts->csv_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--csv-max-mb") == 0 && i + 1 < argc) {
+            opts->csv_max_mb = static_cast<size_t>(std::atoi(argv[++i]));
         }
 #ifdef ENABLE_PHASOR
         else if (std::strcmp(argv[i], "--phasor") == 0 && i + 1 < argc) {
@@ -157,6 +262,8 @@ static int parse_args(int argc, char **argv, Options *opts)
         }
     }
 
+    if (opts->list_only) return 0;
+
     if (!opts->interface_name) {
         std::fprintf(stderr, "Error: --interface is required\n");
         print_usage(argv[0]);
@@ -173,17 +280,28 @@ int main(int argc, char **argv)
     int rc = parse_args(argc, argv, &opts);
     if (rc != 0) return rc < 0 ? 1 : 0;
 
+    /* --list: show interfaces and exit */
+    if (opts.list_only)
+        return list_interfaces() == 0 ? 0 : 1;
+
+    /* Resolve interface name or index */
+    char iface_buf[256] = {};
+    const char *iface = resolve_interface(opts.interface_name, iface_buf, sizeof(iface_buf));
+    if (!iface) return 1;
+
     /* Open CSV if requested */
     if (opts.csv_path) {
-        g_csv = std::fopen(opts.csv_path, "w");
+        g_csv_path = opts.csv_path;
+        if (opts.csv_max_mb > 0)
+            g_csv_max_bytes = opts.csv_max_mb * 1024ULL * 1024ULL;
+        g_csv = std::fopen(g_csv_path, "w");
         if (!g_csv) {
-            std::fprintf(stderr, "Error: cannot open CSV file: %s\n", opts.csv_path);
+            std::fprintf(stderr, "Error: cannot open CSV file: %s\n", g_csv_path);
             return 1;
         }
-        /* CSV header */
-        std::fprintf(g_csv, "timestamp_us,svID,smpCnt,confRev,smpSynch,channelCount");
-        /* Dynamic channel columns written per-row since channel count may vary */
-        std::fputc('\n', g_csv);
+        csv_write_header();
+        std::fprintf(stderr, "CSV output: %s (max %zu MB, overwrites when full)\n",
+                     g_csv_path, g_csv_max_bytes / (1024 * 1024));
     }
 
 #ifdef ENABLE_PHASOR
@@ -196,7 +314,7 @@ int main(int argc, char **argv)
 
     /* Open capture */
     char errbuf[256] = {};
-    g_cap = sv_capture_open(opts.interface_name, opts.filter,
+    g_cap = sv_capture_open(iface, opts.filter,
                             errbuf, sizeof(errbuf));
     if (!g_cap) {
         std::fprintf(stderr, "Error: %s\n", errbuf);
@@ -208,8 +326,7 @@ int main(int argc, char **argv)
     std::signal(SIGINT, on_sigint);
     std::signal(SIGTERM, on_sigint);
 
-    std::fprintf(stderr, "Capturing SV on %s (Ctrl+C to stop)...\n",
-                 opts.interface_name);
+    std::fprintf(stderr, "Capturing SV on %s (Ctrl+C to stop)...\n", iface);
 
     /* Blocking capture loop — returns on SIGINT or error */
     rc = sv_capture_run(g_cap, on_packet, nullptr);
