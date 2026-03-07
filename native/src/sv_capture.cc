@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <sys/select.h>
+#include <cerrno>
 
 /* ── Internal state ──────────────────────────────────────────────────────── */
 
@@ -82,20 +84,41 @@ int sv_capture_run(SvCapture *cap, sv_packet_cb cb, void *user_data)
     cap->cb        = cb;
     cap->user_data = user_data;
 
-    /* pcap_dispatch with cnt=0: process all packets available in one
-       read timeout period, blocking when idle. No busy loop. */
+    int fd = pcap_get_selectable_fd(cap->pcap);
+    if (fd == PCAP_ERROR) {
+        std::fprintf(stderr, "pcap_get_selectable_fd: not supported on this platform\n");
+        return -1;
+    }
+
     for (;;) {
-        int n = pcap_dispatch(cap->pcap, 0,
-                      sv_pcap_handler,
-                      reinterpret_cast<u_char *>(cap));
-        if (n == PCAP_ERROR_BREAK) return 0;   /* sv_capture_stop() called */
+        /* Block here until the pcap fd is readable or timeout fires */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        struct timeval tv = { 0, SV_CAP_TIMEOUT_MS * 1000 };  /* 10ms */
+        int ret = select(fd + 1, &rfds, nullptr, nullptr, &tv);
+
+        if (ret < 0) {
+            if (errno == EINTR) continue;   /* signal interrupted — retry */
+            std::perror("select");
+            return -1;
+        }
+        /* ret == 0 → timeout, no data; ret > 0 → data ready.
+           Either way, call dispatch to let pcap_breakloop be honoured. */
+
+        int n = pcap_dispatch(cap->pcap, -1,
+                              sv_pcap_handler,
+                              reinterpret_cast<u_char *>(cap));
+
+        if (n == PCAP_ERROR_BREAK) return 0;
         if (n == PCAP_ERROR) {
             std::fprintf(stderr, "pcap_dispatch: %s\n", pcap_geterr(cap->pcap));
             return -1;
         }
-        /* n == 0 means timeout with no packets — loop back (blocking) */
     }
 }
+
 
 void sv_capture_stop(SvCapture *cap)
 {

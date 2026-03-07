@@ -3,10 +3,10 @@
  * @brief SV Subscriber — standalone terminal application
  *
  * Usage:
- *   ./sv_subscriber --interface eth0 [--filter "ether proto 0x88ba"] [--csv output.csv]
+ *   ./sv_subscriber --interface eth0 [--filter "ether proto 0x88ba"]
  *
  * Captures IEC 61850 Sampled Values from the network, decodes them,
- * and prints one line per sample to stdout (or CSV file).
+ * and prints one line per sample to stdout.
  * Ctrl+C to stop gracefully.
  */
 
@@ -28,40 +28,12 @@
 /* ── Global state (minimal) ──────────────────────────────────────────────── */
 
 static SvCapture   *g_cap = nullptr;
-static FILE        *g_csv = nullptr;
-static const char  *g_csv_path = nullptr;
-static size_t       g_csv_bytes = 0;
-static size_t       g_csv_max_bytes = 100ULL * 1024 * 1024;  /* default 100 MB */
 static std::mutex   g_out_mtx;
 static uint64_t     g_frame_count = 0;
 
 #ifdef ENABLE_PHASOR
 static SvPhasorEngine *g_phasor = nullptr;
 #endif
-
-/* ── CSV helpers ──────────────────────────────────────────────────────────── */
-
-static void csv_write_header(void)
-{
-    std::fprintf(g_csv, "timestamp_us,svID,smpCnt,confRev,smpSynch,channelCount\n");
-    g_csv_bytes = std::ftell(g_csv);
-}
-
-/** Truncate and restart the CSV file when it exceeds the size limit. */
-static void csv_rotate_if_needed(void)
-{
-    if (!g_csv || g_csv_bytes < g_csv_max_bytes) return;
-
-    std::fclose(g_csv);
-    g_csv = std::fopen(g_csv_path, "w");
-    if (!g_csv) {
-        std::fprintf(stderr, "Warning: failed to rotate CSV, disabling output\n");
-        return;
-    }
-    csv_write_header();
-    std::fprintf(stderr, "[csv] File rotated (exceeded %zu MB limit)\n",
-                 g_csv_max_bytes / (1024 * 1024));
-}
 
 /* ── Signal handler ──────────────────────────────────────────────────────── */
 
@@ -89,32 +61,11 @@ static void on_packet(const uint8_t *buffer, size_t length,
         sv_format_mac(frame.header.dst_mac, mac_dst, sizeof(mac_dst));
 
         /* stdout: one-liner per ASDU */
-        std::printf("%" PRIu64 " | %s -> %s | appID=0x%04X | svID=%-16s "
-                    "| smpCnt=%5u | confRev=%u | ch=%u |",
-                    ts_us, mac_src, mac_dst,
-                    frame.header.app_id, a->sv_id,
-                    a->smp_cnt, a->conf_rev, a->channel_count);
+        
 
         for (uint8_t ch = 0; ch < a->channel_count; ++ch)
             std::printf(" %d", a->values[ch]);
         std::putchar('\n');
-
-        /* CSV output */
-        if (g_csv) {
-            csv_rotate_if_needed();
-            if (g_csv) {
-                int n = std::fprintf(g_csv, "%" PRIu64 ",%s,%u,%u,%u,%u",
-                             ts_us, a->sv_id, a->smp_cnt, a->conf_rev,
-                             a->smp_synch, a->channel_count);
-                if (n > 0) g_csv_bytes += n;
-                for (uint8_t ch = 0; ch < a->channel_count; ++ch) {
-                    n = std::fprintf(g_csv, ",%d,%u", a->values[ch], a->quality[ch]);
-                    if (n > 0) g_csv_bytes += n;
-                }
-                std::fputc('\n', g_csv);
-                g_csv_bytes += 1;
-            }
-        }
 
 #ifdef ENABLE_PHASOR
         if (g_phasor) {
@@ -202,8 +153,6 @@ static const char *resolve_interface(const char *input, char *buf, size_t buf_le
 struct Options {
     const char *interface_name;
     const char *filter;
-    const char *csv_path;
-    size_t      csv_max_mb;     /* max CSV size in MB (0 = default 100) */
     bool        list_only;
     uint16_t    phasor_spc;
     uint8_t     phasor_ch;
@@ -218,8 +167,6 @@ static void print_usage(const char *prog)
         "  --interface <name|#> Network interface name or index number\n"
         "  --list               List available interfaces and exit\n"
         "  --filter <bpf>       BPF filter (default: \"ether proto 0x88ba\")\n"
-        "  --csv <path>         Write decoded samples to CSV file\n"
-        "  --csv-max-mb <N>     Max CSV size in MB before overwrite (default: 100)\n"
 #ifdef ENABLE_PHASOR
         "  --phasor <spc>       Enable phasor (samples per cycle, e.g. 80)\n"
         "  --phasor-ch <n>      Phasor channel count (default 8)\n"
@@ -240,10 +187,6 @@ static int parse_args(int argc, char **argv, Options *opts)
             opts->list_only = true;
         } else if (std::strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
             opts->filter = argv[++i];
-        } else if (std::strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
-            opts->csv_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--csv-max-mb") == 0 && i + 1 < argc) {
-            opts->csv_max_mb = static_cast<size_t>(std::atoi(argv[++i]));
         }
 #ifdef ENABLE_PHASOR
         else if (std::strcmp(argv[i], "--phasor") == 0 && i + 1 < argc) {
@@ -289,21 +232,6 @@ int main(int argc, char **argv)
     const char *iface = resolve_interface(opts.interface_name, iface_buf, sizeof(iface_buf));
     if (!iface) return 1;
 
-    /* Open CSV if requested */
-    if (opts.csv_path) {
-        g_csv_path = opts.csv_path;
-        if (opts.csv_max_mb > 0)
-            g_csv_max_bytes = opts.csv_max_mb * 1024ULL * 1024ULL;
-        g_csv = std::fopen(g_csv_path, "w");
-        if (!g_csv) {
-            std::fprintf(stderr, "Error: cannot open CSV file: %s\n", g_csv_path);
-            return 1;
-        }
-        csv_write_header();
-        std::fprintf(stderr, "CSV output: %s (max %zu MB, overwrites when full)\n",
-                     g_csv_path, g_csv_max_bytes / (1024 * 1024));
-    }
-
 #ifdef ENABLE_PHASOR
     if (opts.phasor_spc > 0) {
         g_phasor = sv_phasor_create(opts.phasor_spc, opts.phasor_ch);
@@ -318,7 +246,6 @@ int main(int argc, char **argv)
                             errbuf, sizeof(errbuf));
     if (!g_cap) {
         std::fprintf(stderr, "Error: %s\n", errbuf);
-        if (g_csv) std::fclose(g_csv);
         return 1;
     }
 
@@ -338,8 +265,6 @@ int main(int argc, char **argv)
 #ifdef ENABLE_PHASOR
     if (g_phasor) sv_phasor_destroy(g_phasor);
 #endif
-
-    if (g_csv) std::fclose(g_csv);
 
     std::fprintf(stderr, "\nCaptured %" PRIu64 " samples.\n", g_frame_count);
     return rc == 0 ? 0 : 1;
