@@ -10,6 +10,7 @@
 #include <cstring>
 #include <sys/select.h>
 #include <cerrno>
+#include <time.h>
 
 /* ── Internal state ──────────────────────────────────────────────────────── */
 
@@ -41,13 +42,23 @@ SvCapture *sv_capture_open(const char *interface_name,
 
     char pcap_errbuf[PCAP_ERRBUF_SIZE] = {};
 
-    pcap_t *p = pcap_open_live(interface_name,
-                               SV_CAP_SNAPLEN,
-                               SV_CAP_PROMISC,
-                               SV_CAP_TIMEOUT_MS,
-                               pcap_errbuf);
+    /* Use pcap_create + pcap_activate instead of pcap_open_live so we can
+       disable immediate mode.  With immediate_mode off, the AF_PACKET
+       socket batches frames and only wakes select() at the timeout
+       interval (~10 ms) instead of on every single frame (4000 fps). */
+    pcap_t *p = pcap_create(interface_name, pcap_errbuf);
     if (!p) {
-        std::snprintf(errbuf, errbuf_len, "pcap_open_live: %s", pcap_errbuf);
+        std::snprintf(errbuf, errbuf_len, "pcap_create: %s", pcap_errbuf);
+        return nullptr;
+    }
+    pcap_set_snaplen(p, SV_CAP_SNAPLEN);
+    pcap_set_promisc(p, SV_CAP_PROMISC);
+    pcap_set_timeout(p, SV_CAP_TIMEOUT_MS);
+    pcap_set_immediate_mode(p, 0);  /* batch frames — critical for CPU */
+    int activate_rc = pcap_activate(p);
+    if (activate_rc < 0) {
+        std::snprintf(errbuf, errbuf_len, "pcap_activate: %s", pcap_geterr(p));
+        pcap_close(p);
         return nullptr;
     }
 
@@ -104,8 +115,11 @@ int sv_capture_run(SvCapture *cap, sv_packet_cb cb, void *user_data)
             std::perror("select");
             return -1;
         }
-        /* ret == 0 → timeout, no data; ret > 0 → data ready.
-           Either way, call dispatch to let pcap_breakloop be honoured. */
+
+        /* ret == 0 → genuine timeout, no data on socket.  Skip the
+           syscall into pcap_dispatch — there is nothing to read.
+           pcap_breakloop is checked at the top of the next select(). */
+        if (ret == 0) continue;
 
         int n = pcap_dispatch(cap->pcap, -1,
                               sv_pcap_handler,
@@ -115,6 +129,15 @@ int sv_capture_run(SvCapture *cap, sv_packet_cb cb, void *user_data)
         if (n == PCAP_ERROR) {
             std::fprintf(stderr, "pcap_dispatch: %s\n", pcap_geterr(cap->pcap));
             return -1;
+        }
+
+        /* BPF filter discarded everything (non-SV traffic on a busy link).
+           Without this sleep we spin: select(ready) → dispatch(0) → repeat.
+           Sleep for the pcap timeout interval to avoid burning CPU. */
+        if (n == 0) {
+            struct timespec ts = { 0, SV_CAP_TIMEOUT_MS * 1000000L };
+            while (nanosleep(&ts, &ts) == -1 && errno == EINTR)
+                ;  /* retry on signal interruption */
         }
     }
 }

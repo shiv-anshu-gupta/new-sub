@@ -1,13 +1,12 @@
-//! Tauri commands — the bridge between JavaScript frontend and C++ backend
+//! Tauri commands — the bridge between the service API and C++ backend
 //!
-//! Each #[tauri::command] function is callable from JS via:
-//!   await window.__TAURI__.core.invoke('command_name', { args })
+//! Each #[tauri::command] function is callable via Tauri invoke().
 //!
 //! Data flow:
-//!   JS invoke() → Rust command → FFI call → C++ function → JSON string → JS
+//!   Service invoke() → Rust command → FFI call → C++ function → JSON
 //!
 //! All heavy processing (decoding, analysis, capture) runs in C++.
-//! Rust only marshals data between JS and C++.
+//! Rust only marshals data.
 
 use crate::db;
 use crate::ffi;
@@ -33,7 +32,7 @@ pub fn init_subscriber(sv_id: String, smp_cnt_max: u16) -> Result<Value, String>
 }
 
 /// Combined poll — returns frames + analysis + status in ONE call
-/// This is the ONLY data polling endpoint used by the frontend
+/// This is the ONLY data polling endpoint
 #[tauri::command]
 pub fn poll_data(start_index: u32, max_frames: u32) -> Result<Value, String> {
     // Get combined data from C++ (single mutex lock, single JSON build)
@@ -47,7 +46,7 @@ pub fn poll_data(start_index: u32, max_frames: u32) -> Result<Value, String> {
         poll_data["captureStats"] = cap_stats;
     }
 
-    // Add timestamp info (precision indicator for frontend)
+    // Add timestamp info (precision indicator for caller)
     let ts_json = ffi::get_timestamp_info_json();
     if let Ok(ts_info) = serde_json::from_str::<Value>(&ts_json) {
         poll_data["timestampInfo"] = ts_info;
@@ -182,7 +181,7 @@ pub fn get_timestamp_info() -> Result<Value, String> {
 // ============================================================================
 
 /// Start a new SQLite recording session.
-/// Called by frontend when capture begins. Creates a session row and enables
+/// Called when capture begins. Creates a session row and enables
 /// frame recording in poll_data.
 #[tauri::command]
 pub fn db_start_session(config: db::SessionConfig) -> Result<Value, String> {

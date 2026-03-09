@@ -22,14 +22,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
-#include <mutex>
 #include <cinttypes>
+#include <time.h>
 
 /* ── Global state (minimal) ──────────────────────────────────────────────── */
 
 static SvCapture   *g_cap = nullptr;
-static std::mutex   g_out_mtx;
 static uint64_t     g_frame_count = 0;
+static struct timespec g_last_fps_ts = {};
+static uint64_t     g_fps_count = 0;
 
 #ifdef ENABLE_PHASOR
 static SvPhasorEngine *g_phasor = nullptr;
@@ -51,38 +52,42 @@ static void on_packet(const uint8_t *buffer, size_t length,
     if (sv_decode_frame(buffer, length, &frame) != 0)
         return;
 
-    std::lock_guard<std::mutex> lock(g_out_mtx);
-
     for (uint8_t i = 0; i < frame.asdu_count; ++i) {
         const SvAsdu *a = &frame.asdus[i];
-
-        char mac_src[18], mac_dst[18];
-        sv_format_mac(frame.header.src_mac, mac_src, sizeof(mac_src));
-        sv_format_mac(frame.header.dst_mac, mac_dst, sizeof(mac_dst));
-
-        /* stdout: one-liner per ASDU */
-        
-
-        for (uint8_t ch = 0; ch < a->channel_count; ++ch)
-            std::printf(" %d", a->values[ch]);
-        std::putchar('\n');
 
 #ifdef ENABLE_PHASOR
         if (g_phasor) {
             int rc = sv_phasor_feed(g_phasor, a->values, a->channel_count, ts_us);
             if (rc == 1) {
                 const SvPhasorResult *pr = sv_phasor_result(g_phasor);
-                std::printf("  [phasor] ");
+                std::fprintf(stderr, "  [phasor] ");
                 for (uint8_t ch = 0; ch < pr->channel_count; ++ch)
-                    std::printf("ch%u: %.2f∠%.1f°  ", ch,
+                    std::fprintf(stderr, "ch%u: %.2f∠%.1f°  ", ch,
                                 pr->channels[ch].magnitude,
                                 pr->channels[ch].angle_deg);
-                std::putchar('\n');
+                std::fputc('\n', stderr);
             }
         }
 #endif
 
         ++g_frame_count;
+        ++g_fps_count;
+    }
+
+    /* Lightweight FPS counter — one fprintf(stderr) per second.
+       clock_gettime is a vDSO call (~5 ns), not a syscall. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (g_last_fps_ts.tv_sec == 0) {
+        g_last_fps_ts = now;
+    } else {
+        long elapsed_ns = (now.tv_sec - g_last_fps_ts.tv_sec) * 1000000000L
+                        + (now.tv_nsec - g_last_fps_ts.tv_nsec);
+        if (elapsed_ns >= 1000000000L) {
+            std::fprintf(stderr, "%" PRIu64 " fps\n", g_fps_count);
+            g_fps_count = 0;
+            g_last_fps_ts = now;
+        }
     }
 }
 

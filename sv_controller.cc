@@ -474,7 +474,7 @@ int SvController::stopAll()
     m_sharedBuffer.clear();
 
     /* Defense-in-depth: clear all publishers so stale state never persists.
-     * The frontend always does removeAll + add + configure before each start,
+     * The caller always does removeAll + add + configure before each start,
      * so keeping old publishers serves no purpose and risks accumulation bugs. */
     {
         std::lock_guard<std::mutex> lock(m_mutex);

@@ -44,6 +44,14 @@ add_library(sv_lib STATIC ${LIB_SOURCES})
 target_include_directories(sv_lib PUBLIC ${INCLUDE_DIRS})
 target_link_libraries(sv_lib PUBLIC ${PCAP_LIB})
 
+# Release optimisation — enables inlining, vectorisation, dead-code elimination
+# in the BER decoder, frame parser, and phasor hot paths.
+# Build with: cmake -DCMAKE_BUILD_TYPE=Release .. && make
+target_compile_options(sv_lib PRIVATE
+    $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native>)
+target_compile_options(sv_lib PRIVATE
+    $<$<CONFIG:RelWithDebInfo>:-O2 -DNDEBUG -march=native>)
+
 if(ENABLE_PHASOR)
     target_compile_definitions(sv_lib PUBLIC ENABLE_PHASOR)
 endif()
@@ -65,6 +73,10 @@ endif()
 
 add_executable(sv_subscriber src/main.cc)
 target_link_libraries(sv_subscriber PRIVATE sv_lib)
+target_compile_options(sv_subscriber PRIVATE
+    $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native>)
+target_compile_options(sv_subscriber PRIVATE
+    $<$<CONFIG:RelWithDebInfo>:-O2 -DNDEBUG -march=native>)
 
 # ============================================================================
 # Install

@@ -1,13 +1,13 @@
 //! SQLite persistent storage for SV capture sessions and frame data
 //!
 //! Stores decoded SV frames alongside the in-memory display pipeline.
-//! The live display path (SPSC ring → display buffer → frontend) is untouched.
+//! The live data path (SPSC ring → display buffer → poll_data) is untouched.
 //! SQLite runs as a parallel persistence layer:
 //!
 //! ```text
-//! Drain Thread → Display Buffer → poll_data() → Frontend (existing, unchanged)
+//! Drain Thread → Display Buffer → poll_data() → Caller (existing, unchanged)
 //!                                      │
-//!                                      └──► SQLite (NEW, when recording)
+//!                                      └──► SQLite (when recording)
 //!                                            ├── sessions table (metadata)
 //!                                            └── frames table (decoded data)
 //! ```
@@ -68,7 +68,7 @@ pub struct Database {
     db_path: PathBuf,
 }
 
-/// Configuration for a new capture session — sent from frontend on capture start.
+/// Configuration for a new capture session — sent on capture start.
 /// Field names map to camelCase in JavaScript (via serde rename).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,7 +89,7 @@ pub struct SessionConfig {
     pub repeat_count: u32,
 }
 
-/// Summary data sent from frontend when capture stops.
+/// Summary data sent when capture stops.
 /// Used to finalize the session record with actual results.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -654,7 +654,8 @@ impl Database {
 
         self.pending_frames.clear();
 
-        println!("[db] Flushed {} frames to SQLite", frame_count);
+        // Suppressed: at 4000 fps / batch_size 500, this fired 8×/sec.
+        // Session-level stats are already logged at session start/stop.
         Ok(())
     }
 }
